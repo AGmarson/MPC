@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	exchange "github.com/AGmarson/MPC/grpc"
@@ -18,9 +19,10 @@ import (
 
 var hospitalId int32 = 5000
 var prime int = 39916801
+var receivedMessages int
+var mutex sync.Mutex
 
 func main() {
-	log.SetFlags(log.Lshortfile)
 	arg1, _ := strconv.ParseInt(os.Args[1], 10, 32)
 	ownPort := int32(arg1) + hospitalId //clients are 5001 5002 5003
 
@@ -66,7 +68,7 @@ func main() {
 		//Set up client connections
 		clientCert, err := credentials.NewClientTLSFromFile("certificate/server.crt", "")
 		if err != nil {
-			log.Fatalln("failed to create cert", err)
+			log.Fatal("failed to create cert", err)
 		}
 
 		fmt.Printf("Trying to dial: %v\n", port)
@@ -77,17 +79,20 @@ func main() {
 		defer conn.Close()
 		c := exchange.NewExchangeDataClient(conn)
 		p.clients[port] = c
-		fmt.Printf("%v", p.clients)
 	}
 	scanner := bufio.NewScanner(os.Stdin)
 	if ownPort != hospitalId {
-		fmt.Print("Enter a number between 0 and 1 000 000 to share it secretly with the other peers.\nNumber: ")
+		fmt.Print("Enter a number 0 - 1.000.000 to secretly share it.\nNumber: ")
 		for scanner.Scan() {
-			secret, _ := strconv.ParseInt(scanner.Text(), 10, 32)
-			p.ShareDataChunks(int(secret))
+			secret, err := strconv.ParseInt(scanner.Text(), 10, 32)
+			if err != nil || secret < 0 || secret > 1000000 {
+				fmt.Print("Number must be between 0 and 1.000.000\nNumber: ")
+			} else {
+				p.ShareDataChunks(int(secret))
+			}
 		}
 	} else {
-		fmt.Print("Waiting for data from peers...\nwrite 'quit' to end me\n")
+		fmt.Print("Waiting for data from peers...\nWrite 'quit' to end me\n")
 		for scanner.Scan() {
 			if scanner.Text() == "quit" {
 				return
@@ -105,71 +110,74 @@ type peer struct {
 }
 
 func (p *peer) Exchange(ctx context.Context, req *exchange.Request) (*exchange.Reply, error) {
-	fmt.Print("Here")
+	mutex.Lock()
 	chunk := req.SentData
+	if receivedMessages == 2 && p.id != hospitalId { //if protocol followed correctly, the third message should be the result from hospital
+		fmt.Printf("Received result: %v\nNumber: ", chunk)
+		receivedMessages = 0
+		mutex.Unlock()
+		return &exchange.Reply{ReceivedData: chunk}, nil
+	}
+	receivedMessages++
 	p.receivedChunks = append(p.receivedChunks, int(chunk))
+	mutex.Unlock()
 	if len(p.receivedChunks) == 3 {
-		result := (p.receivedChunks[0] + p.receivedChunks[1] + p.receivedChunks[2]) % prime
-		if p.id == hospitalId {
-			p.BroadCast(result)
-		} else {
-			p.SendToHospital(result)
-		}
-		p.receivedChunks = []int{}
+		go func() {
+			time.Sleep(time.Millisecond * 5) //give time to reply before doing extra stuff
+			p.ProcessResult()
+		}()
 	}
 	rep := &exchange.Reply{ReceivedData: chunk} //this is what I received
 	return rep, nil
 }
 
-func (p *peer) SendToHospital(value int) {
-	hospital := p.clients[hospitalId]
-	request := &exchange.Request{SentData: int32(value)}
-	fmt.Printf("Sending %v to Hospital\n", request.SentData)
-	reply, err := hospital.Exchange(p.ctx, request)
-	if err != nil {
-		log.Printf("something went wrong: %v\n", err)
+func (p *peer) ProcessResult() {
+	result := (p.receivedChunks[0] + p.receivedChunks[1] + p.receivedChunks[2]) % prime
+	if p.id == hospitalId {
+		p.BroadCastResult(result)
+	} else {
+		p.SendDataTo(result, hospitalId)
 	}
-	fmt.Printf("Got reply from Hospital: I got %v\n", reply.ReceivedData)
+	p.receivedChunks = []int{}
 }
 
-func (p *peer) BroadCast(value int) {
-	for id, client := range p.clients {
+func (p *peer) BroadCastResult(value int) {
+	for id := range p.clients {
 		if id == p.id {
 			continue
 		}
-		request := &exchange.Request{SentData: int32(value)}
-		fmt.Printf("Sending %v to %v\n", request.SentData, id)
-		reply, err := client.Exchange(p.ctx, request)
-		if err != nil {
-			log.Printf("something went wrong: %v\n", err)
-		}
-		fmt.Printf("Got reply from id %v: I got %v\n", id, reply.ReceivedData)
+		p.SendDataTo(value, id)
 	}
 }
 
 func (p *peer) ShareDataChunks(secret int) {
 	chunks := ToChunks(secret)
 	i := 0
-	for id, client := range p.clients {
+	for id := range p.clients {
 		if id == hospitalId || id == p.id {
 			continue
 		}
-		request := &exchange.Request{SentData: int32(chunks[i])}
+		p.SendDataTo(chunks[i], id)
 		i++
-		fmt.Printf("Sending %v to %v\n", request.SentData, id)
-		reply, err := client.Exchange(p.ctx, request)
-		if err != nil {
-			log.Printf("something went wrong: %v\n", err)
-		}
-		fmt.Printf("Got reply from id %v: I got %v\n", id, reply.ReceivedData)
 	}
-	fmt.Printf("Keeping %v for myself\n", chunks[i])
+	fmt.Printf("Keeping last chunk %v for myself\n", chunks[i])
 	p.receivedChunks = append(p.receivedChunks, chunks[i])
 	if len(p.receivedChunks) == 3 {
 		result := (p.receivedChunks[0] + p.receivedChunks[1] + p.receivedChunks[2]) % prime
-		p.SendToHospital(result)
+		p.SendDataTo(result, hospitalId)
 		p.receivedChunks = []int{}
 	}
+}
+
+func (p *peer) SendDataTo(data int, id int32) {
+	client := p.clients[id]
+	request := &exchange.Request{SentData: int32(data)}
+	fmt.Printf("Sending %v to %v... ", data, id)
+	reply, err := client.Exchange(p.ctx, request)
+	if err != nil {
+		log.Printf("something went wrong: %v\n", err)
+	}
+	fmt.Printf("%v received: %v\n", id, reply.ReceivedData)
 }
 
 func ToChunks(secret int) []int {
@@ -178,7 +186,7 @@ func ToChunks(secret int) []int {
 	b := rand.Intn(prime - 1)
 	c := (secret - ((a + b) % prime)) % prime
 	if c < 0 {
-		c = prime + c //calculate the actual modulo
+		c = prime + c //calculate the actual modulo (-1 % 5 = 4, not -1)
 	}
 	return []int{a, b, c}
 }

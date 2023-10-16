@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package Exchange;
+option go_package = "https://github.com/AGmarsen/MPC;Exchange";
+
+
+service ExchangeData {
+    rpc exchange (Request) returns (Reply) {}
+}
+
+message Request {
+    int32 sentData = 1;
+}
+
+message Reply {
+    int32 receivedData = 1;
+}
